@@ -1,0 +1,105 @@
+name: release
+
+# Every push to main is checked: if the version in gradle.properties has no release yet,
+# the Mac and Windows apps are built and published as release v<version>.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      released: ${{ steps.read.outputs.released }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(grep '^version=' gradle.properties | cut -d= -f2 | tr -d '[:space:]')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: version
+    if: needs.version.outputs.released == 'false'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: macos-latest
+            name: mac-arm64
+          - os: windows-latest
+            name: windows-x64
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Build, test and package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          ./gradlew build packageApp
+          mkdir out
+          ditto -c -k --keepParent build/dist/app-image/DBViewer.app "out/DBViewer-$VERSION-${{ matrix.name }}.zip"
+
+      - name: Ensure WiX (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $wix3 = $env:WIX -or (Get-Command candle.exe -ErrorAction SilentlyContinue)
+          $wix4 = Get-Command wix.exe -ErrorAction SilentlyContinue
+          if (-not $wix3 -and -not $wix4) {
+            dotnet tool install --global wix --version 5.0.2
+            wix extension add -g WixToolset.UI.wixext/5.0.2
+            wix extension add -g WixToolset.Util.wixext/5.0.2
+          }
+
+      - name: Build, test and package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          ./gradlew build packageInstaller
+          mkdir out
+          cp build/dist/msi/*.msi "out/DBViewer-$VERSION-${{ matrix.name }}.msi"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" out/* \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "DBViewer $VERSION" --generate-notes
